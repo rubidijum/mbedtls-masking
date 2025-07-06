@@ -29,7 +29,12 @@ static int rng_is_initialized = 0;
 
 #if defined(CONFIG_INJECT_MASKS)
 // Injecting masks into the memory for Unicorn emulator
-__attribute__((section(".uninit"))) uint8_t unicorn_injected_mask;
+// 4 byte (32bit) word
+__attribute__((section(".uninit"))) uint32_t unicorn_injected_mask_subword;
+// 4 * 4 bytes = 16 bytes of state
+__attribute__((section(".uninit"))) uint8_t unicorn_injected_mask_sbox[4][4];
+// 4 * 4 bytes (32bit) = 128 bit key
+__attribute__((section(".uninit"))) uint32_t unicorn_injected_mask_key[4];
 #endif /* CONFIG_INJECT_MASKS */
 
 #endif /* CONFIG_MBEDTLS_ENABLE_MASKING */
@@ -632,7 +637,7 @@ static int masked_subword(uint32_t input_masked, uint32_t input_mask,
         return( ret );
     }
     #else
-    fresh_masks = unicorn_injected_mask;
+    fresh_masks = unicorn_injected_mask_subword;
     #endif
 
     volatile uint32_t demasked_input = input_masked ^ input_mask;
@@ -780,10 +785,12 @@ int mbedtls_aes_setkey_enc_masked(mbedtls_aes_context *ctx, const unsigned char 
                            unsigned int keybits)
 {
     mbedtls_printf("Setting AES key with masking...\n");
+    #if !defined(CONGIG_INJECT_MASKS)
     if(rng_init()){
         mbedtls_printf("Failed to initialize RNG context.\n");
         return -1;
     }
+    #endif
 
     if (keybits != 128) {
         mbedtls_printf("Invalid key length: %u bits. Only 128 bits is supported.\n", keybits);
@@ -799,11 +806,14 @@ int mbedtls_aes_setkey_enc_masked(mbedtls_aes_context *ctx, const unsigned char 
     // First 4 words are the same as the original (masked) key
     for (unsigned int i = 0; i < (keybits >> 5); i++) {
         uint32_t original_word = MBEDTLS_GET_UINT32_LE(key, i << 2);
-
+        #if !defined(CONFIG_INJECT_MASKS)
          if(mbedtls_hmac_drbg_random(&drbg_ctx, (unsigned char *)&RK_mask[i], 4)){
                 mbedtls_printf("Failed to generate random mask for key word %u.\n", i);
                 return -1;
          }
+         #else
+         RK_mask[i] = unicorn_injected_mask_key[i];
+         #endif
          RK_masked[i] = original_word ^ RK_mask[i];
 
         //  mbedtls_printf("[0-4] Masked key byte: %x\n", RK_masked[i]);
@@ -1227,10 +1237,14 @@ static int masked_sub_bytes(
             uint8_t m_in = state_mask[r][c];
 
             uint8_t m_out;
+            #if !defined(CONFIG_INJECT_MASKS)
             int ret = mbedtls_hmac_drbg_random(drbg_ctx, &m_out, 1);
             if (ret != 0){
                 return ret;
             }
+            #else
+            m_out = unicorn_injected_mask_sbox[r][c];
+            #endif
 
             volatile uint8_t demasked_byte = x_prim ^ m_in;
 
