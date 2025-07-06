@@ -18,8 +18,8 @@
 #include <string.h>
 
 // #define CONFIG_MBEDTLS_AES_MASKING
-
-#if defined(CONFIG_MBEDTLS_AES_MASKING)
+#if defined(CONFIG_MBEDTLS_ENABLE_MASKING)
+#warning "Compiling with masking enabled"
 #include "mbedtls/entropy.h"
 #include "mbedtls/hmac_drbg.h"
 
