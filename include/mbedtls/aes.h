@@ -66,7 +66,7 @@ typedef struct mbedtls_aes_context {
     int MBEDTLS_PRIVATE(nr);                     /*!< The number of rounds. */
     size_t MBEDTLS_PRIVATE(rk_offset);           /*!< The offset in array elements to AES
                                                     round keys in the buffer. */
-#if defined(CONFIG_MBEDTLS_AES_MASKING)
+#if defined(CONFIG_MBEDTLS_ENABLE_MASKING)
     // Secret shares - don't reveal the clear text variable
     /* For AES-128: 10 round keys + 1 initial = 16 keys * 4 words = 44 words */
     uint32_t MBEDTLS_PRIVATE(buf_masked)[44]; /* Masked values */

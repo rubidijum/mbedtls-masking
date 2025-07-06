@@ -17,7 +17,7 @@
 
 #include <string.h>
 
-// #define CONFIG_MBEDTLS_AES_MASKING
+// #define CONFIG_MBEDTLS_ENABLE_MASKING
 #if defined(CONFIG_MBEDTLS_ENABLE_MASKING)
 #warning "Compiling with masking enabled"
 #include "mbedtls/entropy.h"
@@ -32,7 +32,7 @@ static int rng_is_initialized = 0;
 __attribute__((section(".uninit"))) uint8_t unicorn_injected_mask;
 #endif /* CONFIG_INJECT_MASKS */
 
-#endif /* CONFIG_MBEDTLS_AES_MASKING */
+#endif /* CONFIG_MBEDTLS_ENABLE_MASKING */
 
 #include "mbedtls/aes.h"
 #include "mbedtls/platform.h"
@@ -586,7 +586,7 @@ MBEDTLS_MAYBE_UNUSED static unsigned mbedtls_aes_rk_offset(uint32_t *buf)
     return 0;
 }
 
-#if defined(CONFIG_MBEDTLS_AES_MASKING)
+#if defined(CONFIG_MBEDTLS_ENABLE_MASKING)
 /**
  * @brief RNG context initialization
  */
@@ -876,7 +876,7 @@ int mbedtls_aes_setkey_enc_masked(mbedtls_aes_context *ctx, const unsigned char 
 
     return 0;
 }
-#endif /* CONFIG_MBEDTLS_AES_MASKING */
+#endif /* CONFIG_MBEDTLS_ENABLE_MASKING */
 
 /*
  * AES key schedule (encryption)
@@ -906,7 +906,7 @@ int mbedtls_aes_setkey_enc(mbedtls_aes_context *ctx, const unsigned char *key,
     ctx->rk_offset = mbedtls_aes_rk_offset(ctx->buf);
     RK = ctx->buf + ctx->rk_offset;
 
-#if defined(CONFIG_MBEDTLS_AES_MASKING)
+#if defined(CONFIG_MBEDTLS_ENABLE_MASKING)
     return mbedtls_aes_setkey_enc_masked(ctx, key, keybits);
 #endif
 
@@ -1190,7 +1190,7 @@ int mbedtls_aes_xts_setkey_dec(mbedtls_aes_xts_context *ctx,
                AES_RT3(MBEDTLS_BYTE_3(Y0));     \
     } while (0)
 
-#if defined(CONFIG_MBEDTLS_AES_MASKING)
+#if defined(CONFIG_MBEDTLS_ENABLE_MASKING)
 static void masked_add_round_key(
     uint8_t state_masked[4][4],
     uint8_t state_mask[4][4],
@@ -1306,7 +1306,7 @@ int mbedtls_internal_aes_encrypt_masked(mbedtls_aes_context *ctx,
     
     return 0;
 }
-#endif /* CONFIG_MBEDTLS_AES_MASKING */
+#endif /* CONFIG_MBEDTLS_ENABLE_MASKING */
 
 /*
  * AES-ECB block encryption
@@ -1492,12 +1492,12 @@ int mbedtls_aes_crypt_ecb(mbedtls_aes_context *ctx,
     } else
 #endif
     {
-#if defined(CONFIG_MBEDTLS_AES_MASKING)
+#if defined(CONFIG_MBEDTLS_ENABLE_MASKING)
 
         return mbedtls_internal_aes_encrypt_masked(ctx, input, output);
 #else    
         return mbedtls_internal_aes_encrypt(ctx, input, output);
-#endif /* CONFIG_MBEDTLS_AES_MASKING */
+#endif /* CONFIG_MBEDTLS_ENABLE_MASKING */
     }
 #endif /* !MBEDTLS_AES_USE_HARDWARE_ONLY */
 }
