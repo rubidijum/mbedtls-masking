@@ -19,6 +19,42 @@
 
 // #define CONFIG_MBEDTLS_ENABLE_MASKING
 #if defined(CONFIG_MBEDTLS_ENABLE_MASKING)
+
+#ifndef NDEBUG
+    #include <stdio.h>
+    #define LOG_DEBUG(format, ...) \
+        fprintf(stderr, "[DEBUG] %s:%d: " format "\n", \
+        __FILE__, __LINE__, ##__VA_ARGS__)
+
+static void print_state(const char* title, const uint8_t state[4][4], const uint8_t mask[4][4])
+{
+    printf("--- %s ---\n", title);
+    if (mask != NULL)
+    {
+        for (int r = 0; r < 4; r++)
+        {
+            printf("\t %02x %02x %02x %02x\n",
+                      state[r][0] ^ mask[r][0],
+                      state[r][1] ^ mask[r][1],
+                      state[r][2] ^ mask[r][2],
+                      state[r][3] ^ mask[r][3]);
+        }
+    } else {
+        for (int r = 0; r < 4; r++)
+        {
+            printf("\t  %02x %02x %02x %02x\n",
+                      state[r][0],
+                      state[r][1],
+                      state[r][2],
+                      state[r][3]);
+        }
+    }
+    printf("--- ************** ---\n");
+}
+#else
+    #define LOG_DEBUG(format, ...)
+#endif
+
 #warning "Compiling with masking enabled"
 #include "mbedtls/entropy.h"
 #include "mbedtls/hmac_drbg.h"
@@ -28,6 +64,7 @@ static mbedtls_hmac_drbg_context drbg_ctx;
 static int rng_is_initialized = 0;
 
 static uint8_t masked_sbox[256];
+static uint8_t r_in, r_out;
 
 #if defined(CONFIG_INJECT_MASKS)
 #warning "Mask injection enabled"
@@ -810,13 +847,13 @@ int mbedtls_aes_setkey_enc_masked(mbedtls_aes_context *ctx, const unsigned char 
     // mbedtls_printf("Setting AES key with masking...\n");
 #if !defined(CONFIG_INJECT_MASKS)
     if(rng_init()){
-        // mbedtls_printf("Failed to initialize RNG context.\n");
+        mbedtls_printf("Failed to initialize RNG context.\n");
         return -1;
     }
 #endif /* CONFIG_INJECT_MASKS */
 
     if (keybits != 128) {
-        // mbedtls_printf("Invalid key length: %u bits. Only 128 bits is supported.\n", keybits);
+        mbedtls_printf("Invalid key length: %u bits. Only 128 bits is supported.\n", keybits);
         return (MBEDTLS_ERR_AES_INVALID_KEY_LENGTH);
     }
 
@@ -829,9 +866,10 @@ int mbedtls_aes_setkey_enc_masked(mbedtls_aes_context *ctx, const unsigned char 
     // First 4 words are the same as the original (masked) key
     for (unsigned int i = 0; i < (keybits >> 5); i++) {
         uint32_t original_word = MBEDTLS_GET_UINT32_LE(key, i << 2);
+        LOG_DEBUG("[0-4] original_word: %x\n", original_word);
 #if !defined(CONFIG_INJECT_MASKS)
          if(mbedtls_hmac_drbg_random(&drbg_ctx, (unsigned char *)&RK_mask[i], 4)){
-                // mbedtls_printf("Failed to generate random mask for key word %u.\n", i);
+                mbedtls_printf("Failed to generate random mask for key word %u.\n", i);
                 return -1;
          }
 #else
@@ -839,17 +877,15 @@ int mbedtls_aes_setkey_enc_masked(mbedtls_aes_context *ctx, const unsigned char 
 #endif /* CONFIG_INJECT_MASKS */
          RK_masked[i] = original_word ^ RK_mask[i];
 
-        //  mbedtls_printf("[0-4] Masked key byte: %x\n", RK_masked[i]);
-        //  mbedtls_printf("[0-4] Unmasked key byte: %x | BE: %x\n", RK_masked[i] ^ RK_mask[i], reverse_bytes(RK_masked[i] ^ RK_mask[i]));
+         LOG_DEBUG("[0-4] Masked key byte: %x\n", RK_masked[i]);
+         LOG_DEBUG("[0-4] Unmasked key byte: %x | BE: %x\n", RK_masked[i] ^ RK_mask[i], reverse_bytes(RK_masked[i] ^ RK_mask[i]));
     }
-    // mbedtls_printf("==========================\n");
 
     // Input window pointers: covering the 4 word long windows of data
     uint32_t *rk_m = RK_masked;
     uint32_t *rk_s = RK_mask;
 
     /** Setup the masking */
-    uint8_t r_in, r_out;
 #if !defined(CONFIG_INJECT_MASKS)
     mbedtls_hmac_drbg_random(&drbg_ctx, &r_in, 1);
     mbedtls_hmac_drbg_random(&drbg_ctx, &r_out, 1);
@@ -857,11 +893,12 @@ int mbedtls_aes_setkey_enc_masked(mbedtls_aes_context *ctx, const unsigned char 
     r_in = unicorn_r_in;
     r_out = unicorn_r_out;
 #endif
+    LOG_DEBUG("Using r_in = %d ; r_out = %d\n", r_in, r_out);
     generate_masked_sbox(masked_sbox, r_in, r_out);
 
     // Expand the key
     for (unsigned int i = 0; i < 10; i++, rk_m += 4, rk_s += 4){
-        mbedtls_printf("------- Expanding RK[%d] - RK[%d] -------\n", i*4, i*4+4);
+        LOG_DEBUG("------- Expanding RK[%d] - RK[%d] -------\n", (i+1)*4, (i+1)*4+4);
         // RK[i] = RK[i-4] ^ SubWord(RotWord(RK[i-1])) ^ RCON
 
         // RotWord (on masked values)
@@ -874,14 +911,14 @@ int mbedtls_aes_setkey_enc_masked(mbedtls_aes_context *ctx, const unsigned char 
                                   | (uint32_t) MBEDTLS_BYTE_3(rk_s[3]) << 16
                                   | (uint32_t) MBEDTLS_BYTE_0(rk_s[3]) << 24;
 
-        mbedtls_printf("RotWord [unmasked]: %x | BE: %x\n", temp_rot_masked ^ temp_rot_mask, reverse_bytes(temp_rot_masked ^ temp_rot_mask));
+        LOG_DEBUG("RotWord [unmasked]: %x | BE: %x\n", temp_rot_masked ^ temp_rot_mask, reverse_bytes(temp_rot_masked ^ temp_rot_mask));
     
         // SubWord (on masked values)
         uint32_t temp_sub_masked, temp_sub_mask;
 
         masked_subword(temp_rot_masked, temp_rot_mask, &temp_sub_masked, &temp_sub_mask, masked_sbox, r_in, r_out); // TODO: fix this - pass drbg ctx
 
-        mbedtls_printf("SubWord [unmasked]: %x | BE: %x\n", temp_sub_masked ^ temp_sub_mask, reverse_bytes(temp_sub_masked ^ temp_sub_mask));
+        LOG_DEBUG("SubWord [unmasked]: %x | BE: %x\n", temp_sub_masked ^ temp_sub_mask, reverse_bytes(temp_sub_masked ^ temp_sub_mask));
 
         uint32_t next_word_rcon = temp_sub_masked ^ round_constants[i];
         
@@ -894,7 +931,7 @@ int mbedtls_aes_setkey_enc_masked(mbedtls_aes_context *ctx, const unsigned char 
 
         // next_word_masked ^= round_constants[i];
 
-        mbedtls_printf("RK[%d] [unmasked]: %x | BE: %x\n", i*4, next_word_masked ^ next_word_mask, reverse_bytes(next_word_masked ^ next_word_mask));
+        LOG_DEBUG("\tRK[%d] [unmasked]: %x | BE: %x\n", i*4, next_word_masked ^ next_word_mask, reverse_bytes(next_word_masked ^ next_word_mask));
 
         rk_m[4] = next_word_masked;
         rk_s[4] = next_word_mask;
@@ -902,22 +939,22 @@ int mbedtls_aes_setkey_enc_masked(mbedtls_aes_context *ctx, const unsigned char 
         rk_m[5] = rk_m[1] ^ rk_m[4];
         rk_s[5] = rk_s[1] ^ rk_s[4];
 
-        // mbedtls_printf("[5] Masked key byte: %x\n", RK_masked[5]);
-        mbedtls_printf("RK[%d] Unmasked key byte: %x\n", i*4 + 1, RK_masked[5] ^ RK_mask[5]);
+        // LOG_DEBUG("[5] Masked key byte: %x\n", RK_masked[5]);
+        LOG_DEBUG("\t\tRK[%d] Unmasked key byte: %x | BE: %x\n", i*4 + 1, rk_m[5] ^ rk_s[5], reverse_bytes(rk_m[5] ^ rk_s[5]));
         
         rk_m[6] = rk_m[2] ^ rk_m[5];
         rk_s[6] = rk_s[2] ^ rk_s[5];
 
-        // mbedtls_printf("[6] Masked key byte: %x\n", RK_masked[6]);
-        mbedtls_printf("RK[%d] Unmasked key byte: %x\n", i*4 + 2, RK_masked[6] ^ RK_mask[6]);
+        // LOG_DEBUG("[6] Masked key byte: %x\n", RK_masked[6]);
+        LOG_DEBUG("\t\t\tRK[%d] Unmasked key byte: %x | BE: %x\n", i*4 + 2, rk_m[6] ^ rk_s[6], reverse_bytes(rk_m[6] ^ rk_s[6]));
 
         rk_m[7] = rk_m[3] ^ rk_m[6];
         rk_s[7] = rk_s[3] ^ rk_s[6];
 
-        // mbedtls_printf("[7] Masked key byte: %x\n", RK_masked[7]);
-        mbedtls_printf("RK[%d] Unmasked key byte: %x\n", i*4 + 3, RK_masked[7] ^ RK_mask[7]);
+        // LOG_DEBUG("[7] Masked key byte: %x\n", RK_masked[7]);
+        LOG_DEBUG("\t\t\t\tRK[%d] Unmasked key byte: %x | BE: %x\n", i*4 + 3, rk_m[7] ^ rk_s[7], reverse_bytes(rk_m[7] ^ rk_s[7]));
     }
-    mbedtls_printf("AES key set with masking successfully.\n");
+    LOG_DEBUG("AES key set with masking successfully.\n");
 
     return 0;
 }
@@ -1323,57 +1360,64 @@ int mbedtls_internal_aes_encrypt_masked(mbedtls_aes_context *ctx,
         }
     }
 
-    uint8_t r_in, r_out;
-
-#if !defined(CONFIG_INJECT_MASKS)
-    mbedtls_hmac_drbg_random(&drbg_ctx, &r_in, 1);
-    mbedtls_hmac_drbg_random(&drbg_ctx, &r_out, 1);
-#else
-    r_in = unicorn_r_in;
-    r_out = unicorn_r_out;
-#endif
-
-    // uint8_t masked_sbox[256];
-    // generate_masked_sbox(masked_sbox, r_in, r_out);
+    print_state("State before Initial AddRoundKey (Unmasked)", state_masked, state_mask);
 
     // Initial round key addition
     masked_add_round_key(state_masked, state_mask, ctx->buf_masked, ctx->buf_mask, 0);
 
+    print_state("State after Initial AddRoundKey (Unmasked)", state_masked, state_mask);
+
     for (int round = 1; round < ctx->nr; ++round){
+        LOG_DEBUG("Round %i started =================", round);
         // SubBytes
         masked_sub_bytes(state_masked, state_mask, masked_sbox, r_in, r_out);
+
+        print_state("State after SubBytes (Unmasked)", state_masked, state_mask);
 
         // ShiftRows
         masked_shift_rows(state_masked, state_mask);
 
+        print_state("State after ShiftRows (Unmasked)", state_masked, state_mask);
+
         // MixColumns
         masked_mix_columns(state_masked, state_mask);
 
+        print_state("State after MixColumns (Unmasked)", state_masked, state_mask);
+
         // AddRoundKey
         masked_add_round_key(state_masked, state_mask, ctx->buf_masked, ctx->buf_mask, round);
-    }
 
+        print_state("State after AddRoundKey (Unmasked)", state_masked, state_mask);
+
+        LOG_DEBUG(" ================= Round %i completed.", round);
+    }
+    LOG_DEBUG(" ******** [Final Round] ******** ");
     // Final round
     masked_sub_bytes(state_masked, state_mask, masked_sbox, r_in, r_out);
+
+    print_state("After SubBytes (Unmasked)", state_masked, state_mask);
 
     // ShiftRows
     masked_shift_rows(state_masked, state_mask);
 
+    print_state("After ShiftRows (Unmasked)", state_masked, state_mask);
+
     // AddRoundKey
     masked_add_round_key(state_masked, state_mask, ctx->buf_masked, ctx->buf_mask, ctx->nr);
 
-    mbedtls_printf("AES finished rounds, unmasking...\n");
+    print_state("After AddRoundKey (Unmasked)", state_masked, state_mask);
+
+    LOG_DEBUG("AES finished rounds, unmasking...\n");
 
     // Unmask the output
     for (int r = 0; r < 4; r++){
         for(int c = 0; c < 4; c++){
-            mbedtls_printf("state_mask = %i", state_mask[r][c]);
-            mbedtls_printf("state_masked = %i", state_masked[r][c]);
             output[r + c*4] = state_masked[r][c] ^ state_mask[r][c];
         }
     }
 
-    mbedtls_printf("AES unmasked.\n");
+    LOG_DEBUG("AES unmasked.\n");
+    LOG_DEBUG(" ^^^^^^^^ [Final Round] ^^^^^^^^ ");
     
     return 0;
 }
