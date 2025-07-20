@@ -27,7 +27,10 @@ static mbedtls_entropy_context entropy_ctx;
 static mbedtls_hmac_drbg_context drbg_ctx;
 static int rng_is_initialized = 0;
 
+static uint8_t masked_sbox[256];
+
 #if defined(CONFIG_INJECT_MASKS)
+#warning "Mask injection enabled"
 // Injecting masks into the memory for Unicorn emulator
 // 4 byte (32bit) word
 __attribute__((section(".uninit"))) uint32_t unicorn_injected_mask_subword;
@@ -35,6 +38,12 @@ __attribute__((section(".uninit"))) uint32_t unicorn_injected_mask_subword;
 __attribute__((section(".uninit"))) uint8_t unicorn_injected_mask_sbox[4][4];
 // 4 * 4 bytes (32bit) = 128 bit key
 __attribute__((section(".uninit"))) uint32_t unicorn_injected_mask_key[4];
+// ASCAD r_in mask
+__attribute__((section(".uninit"))) uint8_t unicorn_r_in;
+// ASCAD r_out mask
+__attribute__((section(".uninit"))) uint8_t unicorn_r_out;
+// Initial state masks: r0 - r16
+__attribute__((section(".uninit"))) uint8_t unicorn_r[16];
 #endif /* CONFIG_INJECT_MASKS */
 
 #endif /* CONFIG_MBEDTLS_ENABLE_MASKING */
@@ -593,9 +602,18 @@ MBEDTLS_MAYBE_UNUSED static unsigned mbedtls_aes_rk_offset(uint32_t *buf)
 
 #if defined(CONFIG_MBEDTLS_ENABLE_MASKING)
 /**
+ * @brief Calculates the masked Sbox lookup table
+ */
+static void generate_masked_sbox(uint8_t* masked_sbox, uint8_t r_in, uint8_t r_out){
+    for(int i = 0; i < 256; i++){
+        masked_sbox[i ^ r_in] = FSb[i] ^ r_out;
+    }
+}
+
+/**
  * @brief RNG context initialization
  */
-#if !defined(CONGIG_INJECT_MASKS)
+#if !defined(CONFIG_INJECT_MASKS)
 static int rng_init(void){
    mbedtls_printf("Initializing RNG context...\n");
     if (rng_is_initialized) {
@@ -619,48 +637,53 @@ static int rng_init(void){
     return 0;
 }
 #endif /* !CONFIG_INJECT_MASKS */
-
 /*
- * Masked SubWord implementation for key expansion
+ * @brief Masked SubWord implementation for key expansion
  * Performs masked operation on a 32-bit word
+ * 
+ * @param[in] input_masked
  */
 static int masked_subword(uint32_t input_masked, uint32_t input_mask,
-                          uint32_t* output_masked, uint32_t* output_mask)
+                          uint32_t* output_masked, uint32_t* output_mask,
+                          const uint8_t masked_sbox[256], uint8_t r_in, uint8_t r_out)
 {
     // mbedtls_printf("Performing masked SubWord operation...\n");
-    uint32_t fresh_masks;
-
-    #if !defined(CONGIG_INJECT_MASKS)
-    int ret = mbedtls_hmac_drbg_random(&drbg_ctx, (unsigned char *)&fresh_masks, 4);
-    if (ret != 0) {
-        mbedtls_printf("Failed to generate fresh masks: %d\n", ret);
-        return( ret );
-    }
-    #else
-    fresh_masks = unicorn_injected_mask_subword;
-    #endif
-
-    volatile uint32_t demasked_input = input_masked ^ input_mask;
-    uint32_t sbox_result_masked = 0;
+    // if(drbg_ctx == NULL){
+    //     return -1;
+    // }
+    
+    uint32_t result = 0;
+    uint32_t result_mask = 0;
 
     for(unsigned int i = 0; i < 4; i++){
-        uint8_t temp_demasked_byte = (demasked_input >> (i*8)) & 0xFF;
-        uint8_t temp_mask_out = (fresh_masks >> (i*8)) & 0xFF;
+        uint8_t x_prim = (input_masked >> (i*8)) & 0xFF;
+        uint8_t m_in = (input_mask >> (i*8)) & 0xFF;
 
-        // Secure SBox lookup - using ad-hoc remasked table
-        uint8_t T[256];
-        for(int j = 0; j < 256; j++) {
-            T[j] = FSb[j] ^ temp_mask_out;
+        uint8_t m_out;
+#if !defined(CONFIG_INJECT_MASKS)
+        int ret = mbedtls_hmac_drbg_random(&drbg_ctx, (unsigned char *)&m_out, 1);
+        if (ret != 0) {
+            // mbedtls_printf("Failed to generate fresh masks: %d\n", ret);
+            return ret;
         }
-        uint8_t res_masked_byte = T[temp_demasked_byte];
+#else
+        m_out = (unicorn_injected_mask_subword >> (i * 8)) & 0xFF;
+#endif /* !CONFIG_INJECT_MASKS */
 
-        sbox_result_masked |= ((uint32_t)res_masked_byte << (i*8));
+        uint8_t masked_input = x_prim ^ m_in ^ r_in;
+
+        uint8_t masked_output = masked_sbox[masked_input];
+
+        uint8_t final = masked_output ^ r_out ^ m_out;
+
+        result |= ((uint32_t)final << (i*8));
+        result_mask |= ((uint32_t)m_out << (i*8));
     }
 
-    *output_masked = sbox_result_masked;
-    *output_mask = fresh_masks;
+    *output_masked = result;
+    *output_mask = result_mask;
 
-    return(0);
+    return 0;
 }
 
 static void masked_shift_rows(
@@ -784,16 +807,16 @@ uint32_t reverse_bytes(uint32_t x){
 int mbedtls_aes_setkey_enc_masked(mbedtls_aes_context *ctx, const unsigned char *key,
                            unsigned int keybits)
 {
-    mbedtls_printf("Setting AES key with masking...\n");
-    #if !defined(CONGIG_INJECT_MASKS)
+    // mbedtls_printf("Setting AES key with masking...\n");
+#if !defined(CONFIG_INJECT_MASKS)
     if(rng_init()){
-        mbedtls_printf("Failed to initialize RNG context.\n");
+        // mbedtls_printf("Failed to initialize RNG context.\n");
         return -1;
     }
-    #endif
+#endif /* CONFIG_INJECT_MASKS */
 
     if (keybits != 128) {
-        mbedtls_printf("Invalid key length: %u bits. Only 128 bits is supported.\n", keybits);
+        // mbedtls_printf("Invalid key length: %u bits. Only 128 bits is supported.\n", keybits);
         return (MBEDTLS_ERR_AES_INVALID_KEY_LENGTH);
     }
 
@@ -802,32 +825,43 @@ int mbedtls_aes_setkey_enc_masked(mbedtls_aes_context *ctx, const unsigned char 
     uint32_t *RK_masked = ctx->buf_masked;
     uint32_t *RK_mask = ctx->buf_mask;
 
-    mbedtls_printf("Key length: %u bits, number of rounds: %u\n", keybits, ctx->nr);
+    // mbedtls_printf("Key length: %u bits, number of rounds: %u\n", keybits, ctx->nr);
     // First 4 words are the same as the original (masked) key
     for (unsigned int i = 0; i < (keybits >> 5); i++) {
         uint32_t original_word = MBEDTLS_GET_UINT32_LE(key, i << 2);
-        #if !defined(CONFIG_INJECT_MASKS)
+#if !defined(CONFIG_INJECT_MASKS)
          if(mbedtls_hmac_drbg_random(&drbg_ctx, (unsigned char *)&RK_mask[i], 4)){
-                mbedtls_printf("Failed to generate random mask for key word %u.\n", i);
+                // mbedtls_printf("Failed to generate random mask for key word %u.\n", i);
                 return -1;
          }
-         #else
+#else
          RK_mask[i] = unicorn_injected_mask_key[i];
-         #endif
+#endif /* CONFIG_INJECT_MASKS */
          RK_masked[i] = original_word ^ RK_mask[i];
 
         //  mbedtls_printf("[0-4] Masked key byte: %x\n", RK_masked[i]);
-         mbedtls_printf("[0-4] Unmasked key byte: %x | BE: %x\n", RK_masked[i] ^ RK_mask[i], reverse_bytes(RK_masked[i] ^ RK_mask[i]));
+        //  mbedtls_printf("[0-4] Unmasked key byte: %x | BE: %x\n", RK_masked[i] ^ RK_mask[i], reverse_bytes(RK_masked[i] ^ RK_mask[i]));
     }
-    mbedtls_printf("==========================\n");
+    // mbedtls_printf("==========================\n");
 
     // Input window pointers: covering the 4 word long windows of data
     uint32_t *rk_m = RK_masked;
     uint32_t *rk_s = RK_mask;
 
+    /** Setup the masking */
+    uint8_t r_in, r_out;
+#if !defined(CONFIG_INJECT_MASKS)
+    mbedtls_hmac_drbg_random(&drbg_ctx, &r_in, 1);
+    mbedtls_hmac_drbg_random(&drbg_ctx, &r_out, 1);
+#else
+    r_in = unicorn_r_in;
+    r_out = unicorn_r_out;
+#endif
+    generate_masked_sbox(masked_sbox, r_in, r_out);
+
     // Expand the key
     for (unsigned int i = 0; i < 10; i++, rk_m += 4, rk_s += 4){
-        mbedtls_printf("------ RK[%d] .. RK[%d] -------\n", i*4, i*4+4);
+        mbedtls_printf("------- Expanding RK[%d] - RK[%d] -------\n", i*4, i*4+4);
         // RK[i] = RK[i-4] ^ SubWord(RotWord(RK[i-1])) ^ RCON
 
         // RotWord (on masked values)
@@ -844,14 +878,15 @@ int mbedtls_aes_setkey_enc_masked(mbedtls_aes_context *ctx, const unsigned char 
     
         // SubWord (on masked values)
         uint32_t temp_sub_masked, temp_sub_mask;
-        masked_subword(temp_rot_masked, temp_rot_mask, &temp_sub_masked, &temp_sub_mask);
+
+        masked_subword(temp_rot_masked, temp_rot_mask, &temp_sub_masked, &temp_sub_mask, masked_sbox, r_in, r_out); // TODO: fix this - pass drbg ctx
 
         mbedtls_printf("SubWord [unmasked]: %x | BE: %x\n", temp_sub_masked ^ temp_sub_mask, reverse_bytes(temp_sub_masked ^ temp_sub_mask));
 
         uint32_t next_word_rcon = temp_sub_masked ^ round_constants[i];
         
-        mbedtls_printf("RCON: %x\n", round_constants[i]);
-        mbedtls_printf("XOR with RCON [unmasked]: %x | BE: %x\n", next_word_rcon ^ temp_sub_mask, reverse_bytes(next_word_rcon ^ temp_sub_mask));
+        // mbedtls_printf("RCON: %x\n", round_constants[i]);
+        // mbedtls_printf("XOR with RCON [unmasked]: %x | BE: %x\n", next_word_rcon ^ temp_sub_mask, reverse_bytes(next_word_rcon ^ temp_sub_mask));
 
         // uint32_t next_word_
         uint32_t next_word_masked = rk_m[0] ^ next_word_rcon;
@@ -1225,37 +1260,35 @@ static void masked_add_round_key(
 static int masked_sub_bytes(
     uint8_t state_masked[4][4],
     uint8_t state_mask[4][4],
-    mbedtls_hmac_drbg_context *drbg_ctx)
+    const uint8_t sbox_masked[256],
+    uint8_t r_in,
+    uint8_t r_out)
 {
-    if (drbg_ctx == NULL){
-        return -1;
-    }
+    // if (drbg_ctx == NULL){
+    //     return -1;
+    // }
 
     for (int c = 0; c < 4; c++){
         for(int r = 0; r < 4; r++){
             uint8_t x_prim = state_masked[r][c];
             uint8_t m_in = state_mask[r][c];
 
+            // Transition from m_in to r_in
+            uint8_t masked_input = x_prim ^ m_in ^ r_in;
+
+            uint8_t masked_output = sbox_masked[masked_input];
+
             uint8_t m_out;
-            #if !defined(CONFIG_INJECT_MASKS)
-            int ret = mbedtls_hmac_drbg_random(drbg_ctx, &m_out, 1);
+#if !defined(CONFIG_INJECT_MASKS)
+            int ret = mbedtls_hmac_drbg_random(&drbg_ctx, &m_out, 1);
             if (ret != 0){
                 return ret;
             }
-            #else
+#else
             m_out = unicorn_injected_mask_sbox[r][c];
-            #endif
+#endif /* !CONFIG_INJECT_MASKS */
 
-            volatile uint8_t demasked_byte = x_prim ^ m_in;
-
-            uint8_t T[256];
-            for (int j = 0; j < 256; j++){
-                T[j] = FSb[j] ^ m_out;
-            }
-
-            uint8_t y_prim = T[demasked_byte];
-
-            state_masked[r][c] = y_prim;
+            state_masked[r][c] = masked_output ^ r_out ^ m_out;
             state_mask[r][c] = m_out;
         }
     }
@@ -1274,7 +1307,12 @@ int mbedtls_internal_aes_encrypt_masked(mbedtls_aes_context *ctx,
     uint8_t state_mask[4][4];
 
     uint8_t initial_mask_bytes[16];
+    
+#if !defined(CONFIG_INJECT_MASKS)
     mbedtls_hmac_drbg_random(&drbg_ctx, initial_mask_bytes, 16);
+#else
+    memcpy(initial_mask_bytes, unicorn_r, 16);
+#endif /* !CONFIG_INJECT_MASKS */
 
     // P' = P ^ M
     // Masked plaintext = plaintext XOR mask
@@ -1285,12 +1323,25 @@ int mbedtls_internal_aes_encrypt_masked(mbedtls_aes_context *ctx,
         }
     }
 
+    uint8_t r_in, r_out;
+
+#if !defined(CONFIG_INJECT_MASKS)
+    mbedtls_hmac_drbg_random(&drbg_ctx, &r_in, 1);
+    mbedtls_hmac_drbg_random(&drbg_ctx, &r_out, 1);
+#else
+    r_in = unicorn_r_in;
+    r_out = unicorn_r_out;
+#endif
+
+    // uint8_t masked_sbox[256];
+    // generate_masked_sbox(masked_sbox, r_in, r_out);
+
     // Initial round key addition
     masked_add_round_key(state_masked, state_mask, ctx->buf_masked, ctx->buf_mask, 0);
 
     for (int round = 1; round < ctx->nr; ++round){
         // SubBytes
-        masked_sub_bytes(state_masked, state_mask, &drbg_ctx);
+        masked_sub_bytes(state_masked, state_mask, masked_sbox, r_in, r_out);
 
         // ShiftRows
         masked_shift_rows(state_masked, state_mask);
@@ -1303,7 +1354,7 @@ int mbedtls_internal_aes_encrypt_masked(mbedtls_aes_context *ctx,
     }
 
     // Final round
-    masked_sub_bytes(state_masked, state_mask, &drbg_ctx);
+    masked_sub_bytes(state_masked, state_mask, masked_sbox, r_in, r_out);
 
     // ShiftRows
     masked_shift_rows(state_masked, state_mask);
@@ -1311,12 +1362,18 @@ int mbedtls_internal_aes_encrypt_masked(mbedtls_aes_context *ctx,
     // AddRoundKey
     masked_add_round_key(state_masked, state_mask, ctx->buf_masked, ctx->buf_mask, ctx->nr);
 
+    mbedtls_printf("AES finished rounds, unmasking...\n");
+
     // Unmask the output
     for (int r = 0; r < 4; r++){
         for(int c = 0; c < 4; c++){
+            mbedtls_printf("state_mask = %i", state_mask[r][c]);
+            mbedtls_printf("state_masked = %i", state_masked[r][c]);
             output[r + c*4] = state_masked[r][c] ^ state_mask[r][c];
         }
     }
+
+    mbedtls_printf("AES unmasked.\n");
     
     return 0;
 }
@@ -2402,6 +2459,7 @@ int mbedtls_aes_self_test(int verbose)
             }
 
             for (j = 0; j < 10000; j++) {
+                mbedtls_printf("Running AES ECB %i/10000\n", j);
                 ret = mbedtls_aes_crypt_ecb(&ctx, mode, buf, buf);
                 if (ret != 0) {
                     mbedtls_printf("mbedtls_aes_crypt_ecb failed");
@@ -2411,7 +2469,7 @@ int mbedtls_aes_self_test(int verbose)
 
             if (memcmp(buf, aes_tests, 16) != 0) {
                 for(int i = 0; i < 16; i++){
-                    mbedtls_printf("-----");
+                    mbedtls_printf("-----\n");
                     mbedtls_printf("Expected: %x\n", aes_tests[i]);
                     mbedtls_printf("Calculated: %x\n", buf[i]);
                     mbedtls_printf("-----");
