@@ -20,7 +20,7 @@
 // #define CONFIG_MBEDTLS_ENABLE_MASKING
 #if defined(CONFIG_MBEDTLS_ENABLE_MASKING)
 
-#ifndef NDEBUG
+#ifdef DEBUG
     #include <stdio.h>
     #define LOG_DEBUG(format, ...) \
         fprintf(stderr, "[DEBUG] %s:%d: " format "\n", \
@@ -53,15 +53,15 @@ static void print_state(const char* title, const uint8_t state[4][4], const uint
 }
 #else
     #define LOG_DEBUG(format, ...)
+
+    static void print_state(const char* title, const uint8_t state[4][4], const uint8_t mask[4][4]){
+        return;
+    }
 #endif
 
 #warning "Compiling with masking enabled"
 #include "mbedtls/entropy.h"
 #include "mbedtls/hmac_drbg.h"
-
-static mbedtls_entropy_context entropy_ctx;
-static mbedtls_hmac_drbg_context drbg_ctx;
-static int rng_is_initialized = 0;
 
 static uint8_t masked_sbox[256];
 static uint8_t r_in, r_out;
@@ -81,6 +81,10 @@ __attribute__((section(".uninit"))) uint8_t unicorn_r_in;
 __attribute__((section(".uninit"))) uint8_t unicorn_r_out;
 // Initial state masks: r0 - r16
 __attribute__((section(".uninit"))) uint8_t unicorn_r[16];
+#else
+static mbedtls_entropy_context entropy_ctx;
+static mbedtls_hmac_drbg_context drbg_ctx;
+static int rng_is_initialized = 0;
 #endif /* CONFIG_INJECT_MASKS */
 
 #endif /* CONFIG_MBEDTLS_ENABLE_MASKING */
