@@ -645,7 +645,7 @@ MBEDTLS_MAYBE_UNUSED static unsigned mbedtls_aes_rk_offset(uint32_t *buf)
 /**
  * @brief Calculates the masked Sbox lookup table
  */
-static void generate_masked_sbox(uint8_t* masked_sbox, uint8_t r_in, uint8_t r_out){
+static void generate_masked_sbox(uint8_t* masked_sbox){
     for(int i = 0; i < 256; i++){
         masked_sbox[i ^ r_in] = FSb[i] ^ r_out;
     }
@@ -685,8 +685,7 @@ static int rng_init(void){
  * @param[in] input_masked
  */
 static int masked_subword(uint32_t input_masked, uint32_t input_mask,
-                          uint32_t* output_masked, uint32_t* output_mask,
-                          const uint8_t masked_sbox[256], uint8_t r_in, uint8_t r_out)
+                          uint32_t* output_masked, uint32_t* output_mask)
 {
     // mbedtls_printf("Performing masked SubWord operation...\n");
     // if(drbg_ctx == NULL){
@@ -711,7 +710,9 @@ static int masked_subword(uint32_t input_masked, uint32_t input_mask,
         m_out = (unicorn_injected_mask_subword >> (i * 8)) & 0xFF;
 #endif /* !CONFIG_INJECT_MASKS */
 
-        uint8_t masked_input = x_prim ^ m_in ^ r_in;
+        // Don't ever load plain secret into memory
+        uint8_t mask_comb =  m_in ^ r_in;
+        uint8_t masked_input = x_prim ^ mask_comb;
 
         uint8_t masked_output = masked_sbox[masked_input];
 
@@ -898,7 +899,7 @@ int mbedtls_aes_setkey_enc_masked(mbedtls_aes_context *ctx, const unsigned char 
     r_out = unicorn_r_out;
 #endif
     LOG_DEBUG("Using r_in = %d ; r_out = %d\n", r_in, r_out);
-    generate_masked_sbox(masked_sbox, r_in, r_out);
+    generate_masked_sbox(masked_sbox);
 
     // Expand the key
     for (unsigned int i = 0; i < 10; i++, rk_m += 4, rk_s += 4){
@@ -920,7 +921,7 @@ int mbedtls_aes_setkey_enc_masked(mbedtls_aes_context *ctx, const unsigned char 
         // SubWord (on masked values)
         uint32_t temp_sub_masked, temp_sub_mask;
 
-        masked_subword(temp_rot_masked, temp_rot_mask, &temp_sub_masked, &temp_sub_mask, masked_sbox, r_in, r_out); // TODO: fix this - pass drbg ctx
+        masked_subword(temp_rot_masked, temp_rot_mask, &temp_sub_masked, &temp_sub_mask);
 
         LOG_DEBUG("SubWord [unmasked]: %x | BE: %x\n", temp_sub_masked ^ temp_sub_mask, reverse_bytes(temp_sub_masked ^ temp_sub_mask));
 
@@ -1284,26 +1285,19 @@ static void masked_add_round_key(
     const uint32_t* rk_mask_sched,
     int round)
 {
-    const uint8_t* key_m = (const uint8_t*)(rk_masked_sched);
-    const uint8_t* key_s = (const uint8_t*)(rk_mask_sched);
-
-    int offset = round * 16;
-
-    for (int c = 0; c < 4; c++){
-        for(int r = 0; r < 4; r++){
-            int state_idx = r + c * 4;
-            state_masked[r][c] ^= key_m[offset + state_idx];
-            state_mask[r][c] ^= key_s[offset + state_idx];
+    for (int c = 0; c < 4; c++) {
+        uint32_t rk_m_word = rk_masked_sched[round * 4 + c];
+        uint32_t rk_s_word = rk_mask_sched[round * 4 + c];
+        for (int r = 0; r < 4; r++) {
+            state_masked[r][c] ^= (uint8_t)(rk_m_word >> (r * 8));
+            state_mask[r][c]   ^= (uint8_t)(rk_s_word >> (r * 8));
         }
     }
 }
 
 static int masked_sub_bytes(
     uint8_t state_masked[4][4],
-    uint8_t state_mask[4][4],
-    const uint8_t sbox_masked[256],
-    uint8_t r_in,
-    uint8_t r_out)
+    uint8_t state_mask[4][4])
 {
     // if (drbg_ctx == NULL){
     //     return -1;
@@ -1315,9 +1309,10 @@ static int masked_sub_bytes(
             uint8_t m_in = state_mask[r][c];
 
             // Transition from m_in to r_in
-            uint8_t masked_input = x_prim ^ m_in ^ r_in;
+            uint8_t temp_masks_in = m_in ^ r_in;
+            uint8_t masked_input = x_prim ^ temp_masks_in;
 
-            uint8_t masked_output = sbox_masked[masked_input];
+            uint8_t masked_output = masked_sbox[masked_input];
 
             uint8_t m_out;
 #if !defined(CONFIG_INJECT_MASKS)
@@ -1329,7 +1324,8 @@ static int masked_sub_bytes(
             m_out = unicorn_injected_mask_sbox[r][c];
 #endif /* !CONFIG_INJECT_MASKS */
 
-            state_masked[r][c] = masked_output ^ r_out ^ m_out;
+            uint8_t temp_masks_out = r_out ^ m_out;
+            state_masked[r][c] = masked_output ^ temp_masks_out;
             state_mask[r][c] = m_out;
         }
     }
@@ -1346,7 +1342,6 @@ int mbedtls_internal_aes_encrypt_masked(mbedtls_aes_context *ctx,
 {
     uint8_t state_masked[4][4];
     uint8_t state_mask[4][4];
-
     uint8_t initial_mask_bytes[16];
     
 #if !defined(CONFIG_INJECT_MASKS)
@@ -1374,7 +1369,7 @@ int mbedtls_internal_aes_encrypt_masked(mbedtls_aes_context *ctx,
     for (int round = 1; round < ctx->nr; ++round){
         LOG_DEBUG("Round %i started =================", round);
         // SubBytes
-        masked_sub_bytes(state_masked, state_mask, masked_sbox, r_in, r_out);
+        masked_sub_bytes(state_masked, state_mask);
 
         print_state("State after SubBytes (Unmasked)", state_masked, state_mask);
 
@@ -1397,7 +1392,7 @@ int mbedtls_internal_aes_encrypt_masked(mbedtls_aes_context *ctx,
     }
     LOG_DEBUG(" ******** [Final Round] ******** ");
     // Final round
-    masked_sub_bytes(state_masked, state_mask, masked_sbox, r_in, r_out);
+    masked_sub_bytes(state_masked, state_mask);
 
     print_state("After SubBytes (Unmasked)", state_masked, state_mask);
 
@@ -1612,7 +1607,6 @@ int mbedtls_aes_crypt_ecb(mbedtls_aes_context *ctx,
 #endif
     {
 #if defined(CONFIG_MBEDTLS_ENABLE_MASKING)
-
         return mbedtls_internal_aes_encrypt_masked(ctx, input, output);
 #else    
         return mbedtls_internal_aes_encrypt(ctx, input, output);
